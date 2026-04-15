@@ -24,7 +24,7 @@
 //! 不要写成 `cargo run / target/release/...`（会把路径当成程序参数）。
 
 /// 默认 Ollama base（本机开发）；QEMU 内请用环境变量 STARRYCLAW_BASE_URL 指向 10.0.2.2 或宿主机局域网 IP
-const DEFAULT_OLLAMA_BASE: &str = "http://192.168.1.8:11434/v1";
+const DEFAULT_OLLAMA_BASE: &str = "http://192.168.1.8:11435/v1";
 const DEFAULT_OLLAMA_MODEL: &str = "kimi-k2.5:cloud";
 
 fn color_enabled() -> bool {
@@ -123,6 +123,7 @@ use openai::{openai_tool_definitions, ChatMessage, Client, ToolCall};
 use serde_json::Value;
 use std::env;
 use std::io::Write;
+use std::time::Instant;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 
 use tools::{ChangeDirTool, ListDirTool, MkdirTool, ReadFileTool, RunShellTool, Tool, ToolResult};
@@ -290,6 +291,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.into());
 
     let client = Client::new(base, model)?;
+
     let mut messages = vec![ChatMessage {
         role: "system".into(),
         content: Some(Value::String(
@@ -327,10 +329,13 @@ async fn main() -> Result<()> {
             continue;
         }
 
+        let started = Instant::now();
         match agent_turn(&client, api_key.as_deref(), line.trim(), &mut messages).await {
             Ok(reply) => {
                 let reply = reply.trim();
+                let elapsed_secs = started.elapsed().as_secs_f64();
                 println!();
+                println!("elapsed: {:.3}s", elapsed_secs);
                 if reply.is_empty() {
                     println!("（没有收到模型回复。可再说具体些；列目录/进目录/读文件/建目录/日期时间等可说明；其它需求模型可建议你在 shell 里试的命令。）");
                 } else {
@@ -339,7 +344,9 @@ async fn main() -> Result<()> {
                 println!();
             }
             Err(e) => {
+                let elapsed_secs = started.elapsed().as_secs_f64();
                 println!();
+                eprintln!("elapsed: {:.3}s", elapsed_secs);
                 eprintln!("error: {e:#}");
                 println!();
             }
