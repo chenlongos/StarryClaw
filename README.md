@@ -35,6 +35,8 @@ cargo build --release
 ```bash
 cargo build --release --target riscv64gc-unknown-linux-musl
 ```
+注意 这个编译(riscv64gc-unknown-linux-musl) 的名字不能变，如果改变了 .cargo/config.toml 要对应修改
+
 开发调试：
 
 ```bash

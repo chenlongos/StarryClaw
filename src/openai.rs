@@ -1,10 +1,11 @@
 //! OpenAI-compatible Chat Completions with `tools` (function calling).
+//! HTTP：`ureq`（blocking + 连接池），在 `tokio::task::spawn_blocking` 里跑，避免在 StarryOS / musl 上踩 `reqwest`/`rustls`（ring）的坑。
+//! 当前依赖未启用 ureq 的 TLS；`STARRYCLAW_BASE_URL` 请用 `http://…`（典型 Ollama 局域网）。HTTPS 需在 Cargo 中为 ureq 打开 `native-tls`（或 `tls`）特性。
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_void};
+use std::time::Duration;
 
 #[derive(Debug, Serialize)]
 pub struct ChatRequest {
@@ -86,139 +87,25 @@ fn content_as_string(c: &Option<Value>) -> Option<String> {
     }
 }
 
-fn maybe_decode_chunked_body(input: &str) -> Option<String> {
-    fn take_line<'a>(s: &'a str, pos: &mut usize) -> Option<&'a str> {
-        if *pos >= s.len() {
-            return None;
-        }
-        let rest = &s[*pos..];
-        if let Some(i) = rest.find('\n') {
-            let mut line = &rest[..i];
-            if let Some(stripped) = line.strip_suffix('\r') {
-                line = stripped;
-            }
-            *pos += i + 1;
-            Some(line)
-        } else {
-            let mut line = rest;
-            if let Some(stripped) = line.strip_suffix('\r') {
-                line = stripped;
-            }
-            *pos = s.len();
-            Some(line)
-        }
-    }
-
-    let mut pos = 0usize;
-    let first = take_line(input, &mut pos)?;
-    let first = first.trim();
-    if first.is_empty() || !first.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-
-    let mut out = String::new();
-    let mut line = first.to_string();
-    loop {
-        let size = usize::from_str_radix(line.trim(), 16).ok()?;
-        if size == 0 {
-            return Some(out);
-        }
-        let rest = &input[pos..];
-        if rest.len() < size {
-            return None;
-        }
-        out.push_str(&rest[..size]);
-        pos += size;
-        if input[pos..].starts_with("\r\n") {
-            pos += 2;
-        } else if input[pos..].starts_with('\n') {
-            pos += 1;
-        } else {
-            return None;
-        }
-        line = take_line(input, &mut pos)?.trim().to_string();
-    }
-}
-
 pub struct Client {
-    host: String,
-    port: i32,
-    base_path: String,
+    agent: ureq::Agent,
+    base: String,
     model: String,
-}
-
-#[derive(Debug, Clone)]
-struct HttpBase {
-    host: String,
-    port: i32,
-    base_path: String,
-}
-
-fn parse_http_base(base: &str) -> Result<HttpBase> {
-    let rest = base
-        .strip_prefix("http://")
-        .with_context(|| format!("base URL must start with http://, got: {base}"))?;
-
-    let (host_port, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    if host_port.is_empty() {
-        anyhow::bail!("base URL missing host: {base}");
-    }
-
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() && !p.is_empty() => {
-            let port = p
-                .parse::<i32>()
-                .with_context(|| format!("invalid port in base URL: {base}"))?;
-            (h.to_string(), port)
-        }
-        _ => (host_port.to_string(), 80),
-    };
-
-    if !(1..=65535).contains(&port) {
-        anyhow::bail!("port out of range in base URL: {base}");
-    }
-
-    Ok(HttpBase {
-        host,
-        port,
-        base_path: path.trim_end_matches('/').to_string(),
-    })
-}
-
-fn join_http_path(base_path: &str, suffix: &str) -> String {
-    let base = if base_path.is_empty() { "/" } else { base_path };
-    if base == "/" {
-        suffix.to_string()
-    } else {
-        format!("{base}{suffix}")
-    }
-}
-
-unsafe extern "C" {
-    fn sc_http_post_json(
-        host: *const c_char,
-        port: c_int,
-        path: *const c_char,
-        json_body: *const c_char,
-        bearer_token: *const c_char,
-        timeout_secs: c_int,
-        status_code: *mut c_int,
-        response_body: *mut *mut c_char,
-        error_msg: *mut *mut c_char,
-    ) -> c_int;
-    fn sc_http_free(ptr: *mut c_void);
 }
 
 impl Client {
     pub fn new(base: String, model: String) -> Result<Self> {
-        let parsed = parse_http_base(&base)?;
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(120))
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(120))
+            .timeout_write(Duration::from_secs(120))
+            .max_idle_connections_per_host(20)
+            .no_delay(true)
+            .build();
         Ok(Self {
-            host: parsed.host,
-            port: parsed.port,
-            base_path: parsed.base_path,
+            agent,
+            base,
             model,
         })
     }
@@ -234,6 +121,7 @@ impl Client {
         messages: Vec<ChatMessage>,
         tools: &[Value],
     ) -> Result<(AssistantMessage, Option<String>)> {
+        let url = format!("{}/chat/completions", self.base.trim_end_matches('/'));
         let body = ChatRequest {
             model: self.model.clone(),
             messages,
@@ -243,99 +131,48 @@ impl Client {
                 Some(tools.to_vec())
             },
         };
-        let json_body = serde_json::to_string(&body).context("serialize chat request")?;
 
-        let host = self.host.clone();
-        let port = self.port;
-        let path = join_http_path(&self.base_path, "/chat/completions");
-        let api_key_owned = api_key.map(ToOwned::to_owned);
+        let agent = self.agent.clone();
+        let bearer = api_key
+            .filter(|k| !k.is_empty())
+            .map(|k| k.to_string());
 
-        let (status, text) = tokio::task::spawn_blocking(move || -> Result<(i32, String)> {
-            let host_c = CString::new(host).context("host contains NUL")?;
-            let path_c = CString::new(path).context("path contains NUL")?;
-            let body_c = CString::new(json_body).context("request body contains NUL")?;
-
-            let key_opt = api_key_owned
-                .as_deref()
-                .filter(|k| !k.is_empty())
-                .map(|k| CString::new(k).context("api key contains NUL"))
-                .transpose()?;
-
-            let key_ptr = key_opt
-                .as_ref()
-                .map_or(std::ptr::null(), |s| s.as_ptr());
-
-            let mut status_code: c_int = 0;
-            let mut response_ptr: *mut c_char = std::ptr::null_mut();
-            let mut error_ptr: *mut c_char = std::ptr::null_mut();
-
-            let rc = unsafe {
-                sc_http_post_json(
-                    host_c.as_ptr(),
-                    port,
-                    path_c.as_ptr(),
-                    body_c.as_ptr(),
-                    key_ptr,
-                    120,
-                    &mut status_code,
-                    &mut response_ptr,
-                    &mut error_ptr,
-                )
-            };
-
-            let response_text = if !response_ptr.is_null() {
-                let s = unsafe { CStr::from_ptr(response_ptr) }
-                    .to_string_lossy()
-                    .into_owned();
-                unsafe { sc_http_free(response_ptr.cast::<c_void>()) };
-                s
-            } else {
-                String::new()
-            };
-
-            let error_text = if !error_ptr.is_null() {
-                let s = unsafe { CStr::from_ptr(error_ptr) }
-                    .to_string_lossy()
-                    .into_owned();
-                unsafe { sc_http_free(error_ptr.cast::<c_void>()) };
-                Some(s)
-            } else {
-                None
-            };
-
-            if rc != 0 {
-                anyhow::bail!(
-                    "chat request failed: {}",
-                    error_text.unwrap_or_else(|| "unknown C HTTP error".into())
-                );
+        let (msg, text_out) = tokio::task::spawn_blocking(move || {
+            let mut req = agent.post(&url);
+            if let Some(ref key) = bearer {
+                req = req.set("Authorization", &format!("Bearer {key}"));
             }
-
-            Ok((status_code, response_text))
+            let resp = req
+                .send_json(&body)
+                .map_err(|e| anyhow::anyhow!("chat request: {e}"))?;
+            let status = resp.status();
+            let body_str = resp
+                .into_string()
+                .map_err(|e| anyhow::anyhow!("read body: {e}"))?;
+            if !(200..300).contains(&status) {
+                anyhow::bail!("HTTP {status} — {}", body_str.trim());
+            }
+            let parsed: ChatResponse = serde_json::from_str(&body_str).with_context(|| {
+                format!(
+                    "parse JSON: {}",
+                    body_str.chars().take(200).collect::<String>()
+                )
+            })?;
+            if let Some(e) = parsed.error {
+                anyhow::bail!("API error: {}", e.message);
+            }
+            let choice = parsed
+                .choices
+                .into_iter()
+                .next()
+                .context("empty choices")?;
+            let msg = choice.message;
+            let text_out = content_as_string(&msg.content);
+            Ok::<_, anyhow::Error>((msg, text_out))
         })
         .await
-        .context("join C HTTP task")??;
+        .context("join HTTP worker")??;
 
-        if !(200..300).contains(&status) {
-            anyhow::bail!("HTTP {} — {}", status, text.trim());
-        }
-
-        let text = maybe_decode_chunked_body(&text).unwrap_or(text);
-
-        let parsed: ChatResponse = serde_json::from_str(&text)
-            .with_context(|| format!("parse JSON: {}", text.chars().take(200).collect::<String>()))?;
-
-        if let Some(e) = parsed.error {
-            anyhow::bail!("API error: {}", e.message);
-        }
-
-        let choice = parsed
-            .choices
-            .into_iter()
-            .next()
-            .context("empty choices")?;
-
-        let msg = choice.message;
-        let text_out = content_as_string(&msg.content);
         Ok((msg, text_out))
     }
 }

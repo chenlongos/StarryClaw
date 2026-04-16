@@ -12,11 +12,12 @@ path = "src/main.rs"
 # 与 musl 全静态链接配合，避免依赖 libgcc 的 unwinder（_Unwind_*）
 panic = "abort"
 
+
 [dependencies]
 anyhow = "1"
+# StarryOS / musl 静态：reqwest+rustls（ring）易踩坑；ureq 走同步 HTTP + 连接池，无 TLS 依赖（适合局域网 http:// Ollama）。
+# 若 STARRYCLAW_BASE_URL 为 https://，请改为 features = ["json", "gzip", "native-tls"]（并处理 musl 下 OpenSSL 链接）。
+ureq = { version = "2.12", default-features = false, features = ["json", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
-
-[build-dependencies]
-cc = "1"
