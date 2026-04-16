@@ -151,17 +151,29 @@ fn infer_robot_task_need(user_text: &str) -> Option<RobotTaskNeed> {
             wheel_min = wheel_min.max(8);
         }
     }
+    let need_grab = ["抓", "捡", "拿起", "pick", "grab"]
+        .iter()
+        .any(|k| t.contains(k));
+    let explicit_release = [
+        "放到", "放在", "放下", "放进", "放入", "装在", "装进", "装入", "塞进", "置入",
+        "release", "drop",
+    ]
+    .iter()
+    .any(|k| t.contains(k));
+    // “拿起 + 放置目标”搬运语义：即使没说“放下”，也应要求 release 完成闭环。
+    let implied_place = need_grab
+        && ["到", "进", "入", "里", "内", "中", "袋", "口袋", "框", "盒", "箱"]
+            .iter()
+            .any(|k| t.contains(k));
+    let need_release = explicit_release || implied_place;
+
     Some(RobotTaskNeed {
         need_camera_detect: ["找", "找到", "寻找", "看见", "识别", "杯子", "衣服"]
             .iter()
             .any(|k| t.contains(k)),
         need_move,
-        need_grab: ["抓", "捡", "拿起", "pick", "grab"]
-            .iter()
-            .any(|k| t.contains(k)),
-        need_release: ["放到", "放在", "放下", "release", "drop"]
-            .iter()
-            .any(|k| t.contains(k)),
+        need_grab,
+        need_release,
         wheel_min,
     })
 }
