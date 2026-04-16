@@ -7,27 +7,12 @@
 //!   STARRYCLAW_API_KEY / OPENAI_API_KEY — 需要时带 `Authorization: Bearer …`（Ollama 一般不用）
 //!   STARRYCLAW_WHEEL_CMD — 可选；`wheel_move` 仅 `println!` 打印「该命令 + forward|backward|left|right」，不 exec
 //!   NO_COLOR / STARRYCLAW_NO_COLOR — 若设置则提示符不用 ANSI 颜色
-//!
-//! **主机用 localhost、QEMU 里 StarryOS 怎么访问 PC 上的 Ollama？**\
-//! - `localhost` / `127.0.0.1` 永远指**当前这台系统自己**。在虚拟机里写 `localhost:11434` 只会找 **StarryOS 自己**，不会穿透到外面的 PC。\
-//! - 要在 StarryOS 里连 **宿主机（你跑 QEMU 的那台 PC）** 上的 Ollama，必须用「从虚拟机视角能到达宿主机」的地址，并用环境变量配置（不要改源码里的默认）：\
-//!   1. **PC 上** Ollama 必须监听 `0.0.0.0:11434`（例如 `OLLAMA_HOST=0.0.0.0 ollama serve`），否则只绑 `127.0.0.1` 时连 SLIRP 都进不来。\
-//!   2. **QEMU 默认 user 网络 (SLIRP)**：在 StarryOS 里设 `STARRYCLAW_BASE_URL=http://10.0.2.2:11434/v1`（`10.0.2.2` 是 QEMU 规定的「宿主机」地址，相当于从虚拟机看 PC）。\
-//!   3. **桥接 / 与 PC 同一局域网**：在 StarryOS 里设 `STARRYCLAW_BASE_URL=http://<PC的局域网IP>:11434/v1`（如 `192.168.1.x`）。\
-//! 4. PC 防火墙放行 TCP **11434**；StarryOS 镜像需启用网络（如 `NET=y`）。
-//!
-//! 运行：\
-//! - 调试：`cargo run`（`target/debug/starryclaw`）\
-//! - **发布优化**：`cargo run --release`（注意是**两个减号** `--release`，不是 `cargo run release`）\
-//! - 或直接：`./target/release/starryclaw`（需先 `cargo build --release`）\
-//! 不要写成 `cargo run / target/release/...`（会把路径当成程序参数）。
 
-/// 默认 Ollama base（本机开发）；QEMU 内请用环境变量 STARRYCLAW_BASE_URL 指向 10.0.2.2 或宿主机局域网 IP
 const DEFAULT_OLLAMA_BASE: &str = "http://192.168.123.247:11434/v1";
 const DEFAULT_OLLAMA_MODEL: &str = "kimi-k2.5:cloud";
 
 fn color_enabled() -> bool {
-    env::var("NO_COLOR").is_err() && env::var("STARRYCLAW_NO_COLOR").is_err()
+    std::env::var("NO_COLOR").is_err() && std::env::var("STARRYCLAW_NO_COLOR").is_err()
 }
 
 fn truncate_model_label(m: &str) -> String {
@@ -41,7 +26,7 @@ fn truncate_model_label(m: &str) -> String {
 }
 
 fn warn_extra_cli_args() {
-    let extra: Vec<String> = env::args().skip(1).collect();
+    let extra: Vec<String> = std::env::args().skip(1).collect();
     if extra.is_empty() {
         return;
     }
@@ -71,7 +56,6 @@ fn print_input_prompt(ollama_model: Option<&str>) {
     }
 }
 
-/// `print!` 走 stdio 缓冲，必须用 std::stdout 刷新，tokio::stdout().flush 刷不到
 fn flush_std_stdout() {
     let _ = std::io::stdout().flush();
 }
@@ -97,11 +81,181 @@ mod tools;
 use anyhow::{Context, Result};
 use openai::{ChatMessage, Client, ToolCall};
 use serde_json::Value;
-use std::env;
 use std::io::Write;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 
 use tools::ToolResult;
+
+// 简化版系统提示（与 Python 测试保持一致）
+const SYSTEM_PROMPT: &str = "You are a robot control agent. You MUST use the provided tools to perform actions. Never output plain text steps; instead, call the appropriate tool (wheel_move, arm_action, camera_capture, object_detect). When the task is complete, you may output a short summary.";
+
+#[derive(Clone, Copy, Default)]
+struct RobotTaskNeed {
+    need_camera_detect: bool,
+    need_move: bool,
+    need_grab: bool,
+    need_release: bool,
+    wheel_min: usize,
+}
+
+#[derive(Default)]
+struct ToolProgress {
+    camera_count: usize,
+    detect_count: usize,
+    wheel_count: usize,
+    arm_grab_count: usize,
+    arm_release_count: usize,
+}
+
+fn infer_robot_task_need(user_text: &str) -> Option<RobotTaskNeed> {
+    let t = user_text.to_lowercase();
+    let need_move = [
+        "走", "前进", "后退", "左转", "右转", "靠近", "放到", "放在", "路径", "绕", "一圈",
+        "move", "path", "walk", "drive",
+    ]
+    .iter()
+    .any(|k| t.contains(k));
+    let shape_with_motion = need_move
+        && (t.contains("正方形")
+            || t.contains("三角形")
+            || t.contains("圆形")
+            || t.contains("矩形")
+            || t.contains("长方形")
+            || t.contains("square")
+            || t.contains("rectangle")
+            || t.contains("triangle")
+            || t.contains("circle"));
+    let has_robot = [
+        "小车", "轮子", "机械臂", "抓", "放", "拍照", "识别", "寻找", "找到", "杯子", "衣服",
+        "走", "前进", "后退", "左转", "右转", "路径", "圆形",
+        "wheel", "arm", "grab", "release", "camera", "detect", "move", "path",
+    ]
+    .iter()
+    .any(|k| t.contains(k))
+        || shape_with_motion;
+    if !has_robot {
+        return None;
+    }
+    let mut wheel_min = if need_move { 1 } else { 0 };
+    if need_move {
+        if t.contains("正方形")
+            || t.contains("矩形")
+            || t.contains("长方形")
+            || t.contains("square")
+            || t.contains("rectangle")
+        {
+            wheel_min = wheel_min.max(8);
+        } else if t.contains("三角形") || t.contains("triangle") {
+            wheel_min = wheel_min.max(6);
+        } else if t.contains("圆形") || t.contains("绕一圈") || t.contains("circle") {
+            wheel_min = wheel_min.max(8);
+        }
+    }
+    Some(RobotTaskNeed {
+        need_camera_detect: ["找", "找到", "寻找", "看见", "识别", "杯子", "衣服"]
+            .iter()
+            .any(|k| t.contains(k)),
+        need_move,
+        need_grab: ["抓", "捡", "拿起", "pick", "grab"]
+            .iter()
+            .any(|k| t.contains(k)),
+        need_release: ["放到", "放在", "放下", "release", "drop"]
+            .iter()
+            .any(|k| t.contains(k)),
+        wheel_min,
+    })
+}
+
+fn tool_progress_update(progress: &mut ToolProgress, tc: &ToolCall) {
+    match tc.function.name.as_str() {
+        "camera_capture" => progress.camera_count += 1,
+        "object_detect" => progress.detect_count += 1,
+        "wheel_move" => progress.wheel_count += 1,
+        "arm_action" => {
+            if let Ok(v) = serde_json::from_str::<Value>(&tc.function.arguments) {
+                if let Some(raw) = v.get("action").and_then(|x| x.as_str()) {
+                    match tools::classify_arm_action(raw) {
+                        Some("grab") => progress.arm_grab_count += 1,
+                        Some("release") => progress.arm_release_count += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn robot_task_satisfied(need: RobotTaskNeed, p: &ToolProgress) -> bool {
+    if need.need_release && need.need_grab && need.need_camera_detect && need.need_move {
+        let wmin = need.wheel_min.max(2);
+        return p.camera_count >= 2
+            && p.detect_count >= 2
+            && p.wheel_count >= wmin
+            && p.arm_grab_count >= 1
+            && p.arm_release_count >= 1;
+    }
+    if need.need_camera_detect && (p.camera_count == 0 || p.detect_count == 0) {
+        return false;
+    }
+    if need.need_move && p.wheel_count < need.wheel_min {
+        return false;
+    }
+    if need.need_grab && p.arm_grab_count == 0 {
+        return false;
+    }
+    if need.need_release && p.arm_release_count == 0 {
+        return false;
+    }
+    true
+}
+
+fn missing_robot_steps(need: RobotTaskNeed, p: &ToolProgress) -> Vec<String> {
+    let mut miss = Vec::new();
+    if need.need_release && need.need_grab && need.need_camera_detect && need.need_move {
+        if p.camera_count < 2 {
+            miss.push(format!("camera_capture x2（当前 {}）", p.camera_count));
+        }
+        if p.detect_count < 2 {
+            miss.push(format!("object_detect x2（当前 {}）", p.detect_count));
+        }
+        let wmin = need.wheel_min.max(2);
+        if p.wheel_count < wmin {
+            miss.push(format!(
+                "wheel_move x{}（当前 {}）",
+                wmin, p.wheel_count
+            ));
+        }
+        if p.arm_grab_count < 1 {
+            miss.push("arm_action grab x1".into());
+        }
+        if p.arm_release_count < 1 {
+            miss.push("arm_action release x1".into());
+        }
+        return miss;
+    }
+    if need.need_camera_detect {
+        if p.camera_count < 1 {
+            miss.push("camera_capture x1".into());
+        }
+        if p.detect_count < 1 {
+            miss.push("object_detect x1".into());
+        }
+    }
+    if need.need_move && p.wheel_count < need.wheel_min {
+        miss.push(format!(
+            "wheel_move x{}（当前 {}）",
+            need.wheel_min, p.wheel_count
+        ));
+    }
+    if need.need_grab && p.arm_grab_count < 1 {
+        miss.push("arm_action grab x1".into());
+    }
+    if need.need_release && p.arm_release_count < 1 {
+        miss.push("arm_action release x1".into());
+    }
+    miss
+}
 
 async fn agent_turn(
     client: &Client,
@@ -110,34 +264,54 @@ async fn agent_turn(
     messages: &mut Vec<ChatMessage>,
 ) -> Result<String> {
     let defs = tools::openai_tool_definitions();
-    let user_payload = format!(
-        "User instruction (may be vague, colloquial, or Chinese short phrases — infer intent):\n{}",
-        user_text
-    );
     messages.push(ChatMessage {
         role: "user".into(),
-        content: Some(Value::String(user_payload)),
+        content: Some(Value::String(user_text.to_string())),
         tool_calls: None,
         tool_call_id: None,
         name: None,
     });
 
-    let max_rounds = 8;
+    let task_need = infer_robot_task_need(user_text);
+    let max_rounds = if task_need.map(|n| n.wheel_min).unwrap_or(0) > 4 {
+        24
+    } else {
+        8
+    };
     let mut final_text = String::new();
     let mut tool_fallback = String::new();
+    let mut tool_trace: Vec<String> = Vec::new();
+    let tool_choice = if task_need.is_some() {
+        Some(serde_json::json!("required"))
+    } else {
+        None
+    };
+    let mut progress = ToolProgress::default();
+    let mut force_retry_count = 0usize;
 
-    for _ in 0..max_rounds {
+    for _round in 0..max_rounds {
         let (assistant, text) = client
-            .chat(api_key, messages.clone(), &defs)
+            .chat(api_key, messages.clone(), &defs, tool_choice.clone())
             .await
             .context("model request")?;
 
         let tool_calls = assistant.tool_calls.clone();
+        let has_tool_calls = tool_calls
+            .as_ref()
+            .map(|tcs| !tcs.is_empty())
+            .unwrap_or(false);
 
-        let assistant_content = match (&text, &tool_calls) {
-            (Some(s), _) => Some(Value::String(s.clone())),
-            (None, Some(tcs)) if !tcs.is_empty() => Some(Value::Null),
-            _ => None,
+        // 关键修复：有 tool_calls 时 content 必须为 None（完全省略字段）
+        let assistant_content = if has_tool_calls {
+            None
+        } else if let Some(ref s) = text {
+            if !s.is_empty() {
+                Some(Value::String(s.clone()))
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         let assistant_msg = ChatMessage {
@@ -152,8 +326,10 @@ async fn agent_turn(
         if let Some(tcs) = tool_calls.filter(|v| !v.is_empty()) {
             let mut batch = String::new();
             for tc in tcs {
+                tool_progress_update(&mut progress, &tc);
                 let out = run_one_tool_call(&tc)?;
                 let piece = out.to_tool_message_content();
+                tool_trace.push(piece.trim_end().to_string());
                 if !batch.is_empty() {
                     batch.push('\n');
                 }
@@ -167,18 +343,89 @@ async fn agent_turn(
                 });
             }
             tool_fallback = batch;
+            if let Some(need) = task_need {
+                if !robot_task_satisfied(need, &progress) {
+                    let missing = missing_robot_steps(need, &progress).join(", ");
+                    messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: Some(Value::String(
+                            format!(
+                                "Robot task still missing required steps: {}. Continue with tool calls only; do not output completion text yet.",
+                                missing
+                            ),
+                        )),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                    });
+                }
+            }
             continue;
         }
 
         if let Some(t) = text {
             final_text = t;
         }
+        if let Some(need) = task_need {
+            if !robot_task_satisfied(need, &progress) && force_retry_count < 2 {
+                force_retry_count += 1;
+                let missing = missing_robot_steps(need, &progress).join(", ");
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: Some(Value::String(
+                        format!(
+                            "Robot task not finished yet. Missing steps: {}. Continue calling tools; do not output final completion text yet.",
+                            missing
+                        ),
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+                continue;
+            }
+        }
         break;
     }
 
     let trimmed = final_text.trim();
+    if let Some(need) = task_need {
+        if !robot_task_satisfied(need, &progress) {
+            let missing = missing_robot_steps(need, &progress).join(", ");
+            if !tool_fallback.is_empty() {
+                let trace = if tool_trace.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\n已执行命令记录：\n{}", tool_trace.join("\n"))
+                };
+                return Ok(format!(
+                    "任务未完成：缺少步骤 {}。请继续调用工具执行，不要只给计划文本。\n\n最近一次工具输出：\n{}{}",
+                    missing, tool_fallback, trace
+                ));
+            }
+            return Ok(format!(
+                "任务未完成：缺少步骤 {}。当前没有有效工具调用结果，请继续执行工具链。",
+                missing
+            ));
+        }
+    }
     if trimmed.is_empty() && !tool_fallback.is_empty() {
-        return Ok(tool_fallback);
+        if tool_trace.is_empty() {
+            return Ok(tool_fallback);
+        }
+        return Ok(format!(
+            "已执行命令记录：\n{}\n\n{}",
+            tool_trace.join("\n"),
+            tool_fallback
+        ));
+    }
+
+    if task_need.is_some() && !tool_trace.is_empty() {
+        return Ok(format!(
+            "已执行命令记录：\n{}\n\n{}",
+            tool_trace.join("\n"),
+            final_text
+        ));
     }
 
     Ok(final_text)
@@ -195,27 +442,19 @@ fn run_one_tool_call(tc: &ToolCall) -> Result<ToolResult> {
 async fn main() -> Result<()> {
     warn_extra_cli_args();
 
-    let api_key = env::var("STARRYCLAW_API_KEY")
-        .or_else(|_| env::var("OPENAI_API_KEY"))
+    let api_key = std::env::var("STARRYCLAW_API_KEY")
+        .or_else(|_| std::env::var("OPENAI_API_KEY"))
         .ok();
 
-    let base = env::var("STARRYCLAW_BASE_URL")
+    let base = std::env::var("STARRYCLAW_BASE_URL")
         .unwrap_or_else(|_| DEFAULT_OLLAMA_BASE.into());
-    let model = env::var("STARRYCLAW_MODEL")
+    let model = std::env::var("STARRYCLAW_MODEL")
         .unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.into());
 
     let client = Client::new(base, model)?;
     let mut messages = vec![ChatMessage {
         role: "system".into(),
-        content: Some(Value::String(
-            "You are StarryClaw (spell the name exactly StarryClaw, never StaryClaw), an autonomous agent on a Unix-like system (e.g. StarryOS). \
-             Tools: list_dir; mkdir (single segment under cwd); change_dir; read_file (text, size-capped); run_shell (single allowlisted program + args, no pipes/shell—see tool schema); wheel_move (wheels: direction forward/backward/left/right or 前/后/左/右; optional distance e.g. 5mm); arm_action (robot arm: grab/release or 抓取/放下). \
-             Prefer tools when they match: 查目录/列文件→list_dir; 进目录→change_dir; 看文件内容→read_file; 建文件夹→mkdir; 底盘轮子含距离如走5mm→wheel_move; 机械臂抓取/放下→arm_action; 日期/时间/今天几号/uname/pwd/whoami/df/cal 等只读系统信息→run_shell（如 date、date +%Y-%m-%d、uname -a）. \
-             When the need is NOT covered by any tool (e.g. grep, curl, free, ps): tell them they can try in their terminal. Start with 「可在 shell 中自行尝试：」and give 1–3 concrete commands with a one-line explanation each. Prefer read-only suggestions; never suggest curl|sh or rm -rf /. \
-             If nothing fits (pure chat, too vague), say e.g. 「当前没有合适的内置工具，也想不到可建议的系统命令。」and optionally one short clarifying question. \
-             After tool calls, summarize briefly in the user's language."
-                .into(),
-        )),
+        content: Some(Value::String(SYSTEM_PROMPT.to_string())),
         tool_calls: None,
         tool_call_id: None,
         name: None,

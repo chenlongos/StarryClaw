@@ -61,7 +61,9 @@ impl ToolResult {
         if self.success {
             // wheel_move / arm_action 已自带「… ok」结尾，避免再拼一层 [ok]
             let custom_done = (self.output.contains("【执行命令】 wheel ->")
-                || self.output.contains("【执行命令】 arm ->"))
+                || self.output.contains("【执行命令】 arm ->")
+                || self.output.contains("【执行命令】 camera ->")
+                || self.output.contains("【执行命令】 vision ->"))
                 && self.output.trim_end().ends_with("ok");
             if !custom_done {
                 s.push_str("[ok]");
@@ -526,6 +528,9 @@ fn normalize_wheel_direction(raw: &str) -> Option<&'static str> {
         "后" | "后退" | "倒" => return Some("backward"),
         "左" | "左转" => return Some("left"),
         "右" | "右转" => return Some("right"),
+        // 对角方向兼容：当前仅有四向轮子工具，按“主转向”退化处理，避免直接报错。
+        "左前" | "左后" | "左前方" | "左后方" => return Some("left"),
+        "右前" | "右后" | "右前方" | "右后方" => return Some("right"),
         _ => {}
     }
     match t.to_lowercase().as_str() {
@@ -603,6 +608,8 @@ fn wheel_move(direction: &str, distance_raw: Option<&str>) -> ToolResult {
     let distance = sanitize_wheel_distance(distance_raw);
     let action_line = wheel_action_line(canonical, &distance);
     let done = wheel_done_message(&action_line);
+    // 实时回显到终端，便于用户直接看到执行命令轨迹
+    print!("{done}");
 
     if let Ok(cmd_line) = env::var("STARRYCLAW_WHEEL_CMD") {
         let parts: Vec<&str> = cmd_line.split_whitespace().filter(|s| !s.is_empty()).collect();
@@ -617,7 +624,6 @@ fn wheel_move(direction: &str, distance_raw: Option<&str>) -> ToolResult {
                 .chain(tokens.into_iter())
                 .collect::<Vec<_>>()
                 .join(" ");
-            println!("{}", done.trim_end());
             println!("(stub) {stub_cmd}");
             return ToolResult {
                 success: true,
@@ -627,7 +633,6 @@ fn wheel_move(direction: &str, distance_raw: Option<&str>) -> ToolResult {
         }
     }
 
-    println!("{}", done.trim_end());
     ToolResult {
         success: true,
         output: done,
@@ -664,6 +669,11 @@ fn wheel_move_def() -> ToolDef {
         }),
         run: tool_wheel_move,
     }
+}
+
+/// 与 `arm_action` 工具一致，用于主循环统计抓取/放下次数（含中文参数）。
+pub fn classify_arm_action(raw: &str) -> Option<&'static str> {
+    normalize_arm_action(raw)
 }
 
 fn normalize_arm_action(raw: &str) -> Option<&'static str> {
@@ -705,6 +715,8 @@ fn arm_action(action: &str) -> ToolResult {
 
     let action_line = arm_action_line(canonical);
     let done = arm_done_message(action_line);
+    // 实时回显到终端，便于用户直接看到执行命令轨迹
+    print!("{done}");
 
     if let Ok(cmd_line) = env::var("STARRYCLAW_ARM_CMD") {
         let parts: Vec<&str> = cmd_line.split_whitespace().filter(|s| !s.is_empty()).collect();
@@ -716,7 +728,6 @@ fn arm_action(action: &str) -> ToolResult {
                 .chain(tokens.into_iter())
                 .collect::<Vec<_>>()
                 .join(" ");
-            println!("{}", done.trim_end());
             println!("(stub) {stub_cmd}");
             return ToolResult {
                 success: true,
@@ -726,7 +737,6 @@ fn arm_action(action: &str) -> ToolResult {
         }
     }
 
-    println!("{}", done.trim_end());
     ToolResult {
         success: true,
         output: done,
@@ -760,6 +770,86 @@ fn arm_action_def() -> ToolDef {
     }
 }
 
+
+fn camera_done_message() -> String {
+    "【执行命令】 camera -> 拍照
+ok
+".to_string()
+}
+
+fn camera_capture() -> ToolResult {
+    let done = camera_done_message();
+    // 实时回显到终端，便于用户直接看到执行命令轨迹
+    print!("{done}");
+    ToolResult {
+        success: true,
+        output: done,
+        error: None,
+    }
+}
+
+fn tool_camera_capture(_v: &Value) -> Result<ToolResult> {
+    Ok(camera_capture())
+}
+
+fn camera_capture_def() -> ToolDef {
+    ToolDef {
+        name: "camera_capture",
+        description: "拍照命令。用于看见物品/寻找物品前先获取当前画面。输出：`【执行命令】 camera -> 拍照` 与 `ok`。",
+        parameters: json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        }),
+        run: tool_camera_capture,
+    }
+}
+
+fn object_detect_message(target: Option<&str>) -> String {
+    let t = target.unwrap_or("目标").trim();
+    // 模拟结果：固定返回可读的距离与位置
+    format!(
+        "【执行命令】 vision -> 识别 {t}
+结果: 距离=1.2m, 位置=左前
+ok
+"
+    )
+}
+
+fn object_detect(target: Option<&str>) -> ToolResult {
+    let done = object_detect_message(target);
+    // 实时回显到终端，便于用户直接看到执行命令轨迹
+    print!("{done}");
+    ToolResult {
+        success: true,
+        output: done,
+        error: None,
+    }
+}
+
+fn tool_object_detect(v: &Value) -> Result<ToolResult> {
+    let target = v.get("target").and_then(|x| x.as_str());
+    Ok(object_detect(target))
+}
+
+fn object_detect_def() -> ToolDef {
+    ToolDef {
+        name: "object_detect",
+        description: "识别物体。可选 target（如 衣服/杯子）。返回距离与位置（示例：距离=1.2m, 位置=左前）。",
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Optional target object name, e.g. 衣服, 杯子, bottle."
+                }
+            },
+            "required": []
+        }),
+        run: tool_object_detect,
+    }
+}
+
 /// 集中注册：顺序即对外暴露给模型的工具顺序。加工具时在文件上方写 `*_def` + `tool_*`，再在此处追加一行。
 fn build_tool_registry() -> Vec<ToolDef> {
     vec![
@@ -770,6 +860,8 @@ fn build_tool_registry() -> Vec<ToolDef> {
         run_shell_def(),
         wheel_move_def(),
         arm_action_def(),
+        camera_capture_def(),
+        object_detect_def(),
     ]
 }
 

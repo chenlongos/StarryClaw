@@ -13,6 +13,8 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +122,7 @@ impl Client {
         api_key: Option<&str>,
         messages: Vec<ChatMessage>,
         tools: &[Value],
+        tool_choice: Option<Value>,
     ) -> Result<(AssistantMessage, Option<String>)> {
         let url = format!("{}/chat/completions", self.base.trim_end_matches('/'));
         let body = ChatRequest {
@@ -130,6 +133,7 @@ impl Client {
             } else {
                 Some(tools.to_vec())
             },
+            tool_choice,
         };
 
         let agent = self.agent.clone();
