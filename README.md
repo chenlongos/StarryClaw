@@ -6,9 +6,8 @@
 
 ## 能做什么
 
-- **在线模式（默认）**：连接 **OpenAI 兼容** 的 Chat Completions API（开发时通常指向本机 **Ollama** `/v1`）。模型可发起 **function / tool calling**，由本程序在本地执行工具并把结果回传给模型，形成多轮推理。
-- **离线模式**：设置 `STARRYCLAW_OFFLINE=1` 后完全不访问网络，用内置的模糊规则处理口语化的列目录、建目录、切换目录、读文件、受限 shell 等指令。
-- **无 Rust 二进制时的兜底**：仓库提供 `scripts/starryclaw-agent.sh`，在仅有 `/bin/sh` 的 StarryOS 镜像上也可做最简单的「查询 / 创建 / ls / mkdir / cd / cat」交互。
+- **在线智能体（唯一模式）**：连接 **OpenAI 兼容** 的 Chat Completions API（开发时通常指向本机 **Ollama** `/v1`）。模型可发起 **function / tool calling**，由本程序在本地执行工具并把结果回传给模型，形成多轮推理。
+- **无 Rust 二进制时的兜底**：仓库提供 `scripts/starryclaw-agent.sh`，在仅有 `/bin/sh` 的 StarryOS 镜像上也可做最简单的「查询 / 创建 / ls / mkdir / cd / cat」交互（与 Rust 版不同，不连模型）。
 
 当前 Rust 版内置工具包括（名称以实际 schema 为准）：**列目录**、**建目录（单层名）**、**切换工作目录**、**读文本文件（有大小上限）**、**受限 shell（仅允许名单内只读类命令等）**。超出工具能力时，Agent 会尽量用自然语言建议你在终端里自行尝试的命令（只读、安全导向）。
 
@@ -58,7 +57,6 @@ sh scripts/starryclaw-agent.sh
 | `STARRYCLAW_BASE_URL` | API 根地址，需包含 `/v1`（如 `http://127.0.0.1:11434/v1`）。QEMU 内访问宿主机 Ollama 时可设为 `http://10.0.2.2:11434/v1` 等。 |
 | `STARRYCLAW_MODEL` | 模型名（与 Ollama / 网关一致）。 |
 | `STARRYCLAW_API_KEY` / `OPENAI_API_KEY` | 需要 Bearer 鉴权时设置（Ollama 本地常可不设）。 |
-| `STARRYCLAW_OFFLINE=1` | 离线模式，不连模型。 |
 | `NO_COLOR` / `STARRYCLAW_NO_COLOR` | 关闭提示符 ANSI 颜色。 |
 
 默认的 `STARRYCLAW_BASE_URL` / `STARRYCLAW_MODEL` 以源码中常量为准；**部署到不同机器时请用环境变量覆盖**，勿硬编码在业务脚本里。

@@ -1,12 +1,10 @@
 //! StarryClaw — small agent with OpenAI-compatible chat + local tools (ls / mkdir).
 //!
-//! **默认即连线模式**：直连本机 Ollama（OpenAI 兼容 `/v1`），无需任何开关。
-//! 只有显式设置 `STARRYCLAW_OFFLINE=1` 时才走离线模糊规则（不访问网络）。
+//! **仅在线智能体**：直连本机或局域网 Ollama（OpenAI 兼容 `/v1`），模型通过 tool calling 驱动本地工具。
 //!
 //! Env:
 //!   STARRYCLAW_BASE_URL / STARRYCLAW_MODEL — 覆盖下方默认（仍指向 Ollama 时可只改端口等）
 //!   STARRYCLAW_API_KEY / OPENAI_API_KEY — 需要时带 `Authorization: Bearer …`（Ollama 一般不用）
-//!   STARRYCLAW_OFFLINE=1 — 离线，不连 Ollama
 //!   NO_COLOR / STARRYCLAW_NO_COLOR — 若设置则提示符不用 ANSI 颜色
 //!
 //! **主机用 localhost、QEMU 里 StarryOS 怎么访问 PC 上的 Ollama？**\
@@ -60,15 +58,7 @@ fn warn_extra_cli_args() {
     );
 }
 
-fn print_input_prompt(offline: bool, ollama_model: Option<&str>) {
-    if offline {
-        if color_enabled() {
-            print!("\x1b[1;36mStarryClaw\x1b[0m \x1b[90m· 离线\x1b[0m › ");
-        } else {
-            print!("StarryClaw · 离线 › ");
-        }
-        return;
-    }
+fn print_input_prompt(ollama_model: Option<&str>) {
     let label = ollama_model.map(truncate_model_label).unwrap_or_else(|| "?".into());
     if color_enabled() {
         print!(
@@ -83,20 +73,6 @@ fn print_input_prompt(offline: bool, ollama_model: Option<&str>) {
 /// `print!` 走 stdio 缓冲，必须用 std::stdout 刷新，tokio::stdout().flush 刷不到
 fn flush_std_stdout() {
     let _ = std::io::stdout().flush();
-}
-
-fn print_banner_offline() {
-    println!();
-    if color_enabled() {
-        println!("\x1b[90m┌─ StarryClaw · 离线\x1b[0m");
-        println!("\x1b[90m│  此处可输入：口语列目录、建文件夹等；按 Enter 发送，quit 退出\x1b[0m");
-        println!("\x1b[90m└──────────────────────────────────────────────\x1b[0m");
-    } else {
-        println!("── StarryClaw · 离线 ──");
-        println!("  在下方提示符后输入，按 Enter 发送；quit 退出");
-        println!("────────────────────────");
-    }
-    println!();
 }
 
 fn print_banner_online(model: &str) {
@@ -114,7 +90,6 @@ fn print_banner_online(model: &str) {
     println!();
 }
 
-mod intent;
 mod openai;
 mod tools;
 
@@ -125,17 +100,7 @@ use std::env;
 use std::io::Write;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 
-use tools::{ChangeDirTool, ListDirTool, MkdirTool, ReadFileTool, RunShellTool, Tool, ToolResult};
-
-fn dispatch_offline(line: &str) -> String {
-    if line.trim().is_empty() {
-        return String::new();
-    }
-    intent::dispatch_fuzzy_offline(line).unwrap_or_else(|| {
-        "没听懂内置的列目录/建目录/进目录/读文件/受限 shell（date、uname 等）。你可以在 shell 里自行试其它命令（如 grep、find、free）；若仍无法完成，请把需求说具体些。"
-            .into()
-    })
-}
+use tools::ToolResult;
 
 async fn agent_turn(
     client: &Client,
@@ -214,11 +179,6 @@ async fn agent_turn(
     if trimmed.is_empty() && !tool_fallback.is_empty() {
         return Ok(tool_fallback);
     }
-    if trimmed.is_empty() {
-        if let Some(fuzzy) = intent::dispatch_fuzzy_offline(user_text) {
-            return Ok(fuzzy);
-        }
-    }
 
     Ok(final_text)
 }
@@ -234,55 +194,9 @@ fn run_one_tool_call(tc: &ToolCall) -> Result<ToolResult> {
 async fn main() -> Result<()> {
     warn_extra_cli_args();
 
-    let offline = env::var("STARRYCLAW_OFFLINE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
     let api_key = env::var("STARRYCLAW_API_KEY")
         .or_else(|_| env::var("OPENAI_API_KEY"))
         .ok();
-
-    if offline {
-        let list = ListDirTool;
-        let mkdir = MkdirTool;
-        let cd = ChangeDirTool;
-        let cat = ReadFileTool;
-        let run_sh = RunShellTool;
-        eprintln!(
-            "StarryClaw 离线模式（环境变量 STARRYCLAW_OFFLINE=1）。要默认连线 Ollama：unset STARRYCLAW_OFFLINE 后重新运行。"
-        );
-        eprintln!(
-            "工具: {} / {} / {} / {} / {}",
-            list.name(),
-            mkdir.name(),
-            cd.name(),
-            cat.name(),
-            run_sh.name()
-        );
-        print_banner_offline();
-        let stdin = io::stdin();
-        let mut reader = BufReader::new(stdin);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            print_input_prompt(true, None);
-            flush_std_stdout();
-            let n = reader.read_line(&mut line).await?;
-            if n == 0 {
-                break;
-            }
-            if line.trim() == "quit" || line.trim() == "exit" {
-                break;
-            }
-            let out = dispatch_offline(&line);
-            if !out.is_empty() {
-                println!();
-                println!("{out}");
-                println!();
-            }
-        }
-        return Ok(());
-    }
 
     let base = env::var("STARRYCLAW_BASE_URL")
         .unwrap_or_else(|_| DEFAULT_OLLAMA_BASE.into());
@@ -314,7 +228,7 @@ async fn main() -> Result<()> {
 
     loop {
         line.clear();
-        print_input_prompt(false, Some(client.model()));
+        print_input_prompt(Some(client.model()));
         flush_std_stdout();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {

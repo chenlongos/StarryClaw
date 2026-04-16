@@ -2,8 +2,8 @@
 # StarryClaw — POSIX shell version for StarryOS (/bin/sh) without Rust binary.
 # Same commands as the Rust starryclaw: 查询 / 创建 / ls / mkdir
 
-echo "StarryClaw 简单智能体 (sh)。输入 quit 退出。"
-while printf "StarryClaw · 离线(sh) › " && IFS= read -r line; do
+echo "StarryClaw sh 兜底（无模型）。输入 quit 退出。"
+while printf "StarryClaw · sh › " && IFS= read -r line; do
 	case $line in
 		quit|exit) break ;;
 	esac
