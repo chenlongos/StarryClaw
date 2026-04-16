@@ -5,6 +5,7 @@
 //! Env:
 //!   STARRYCLAW_BASE_URL / STARRYCLAW_MODEL — 覆盖下方默认（仍指向 Ollama 时可只改端口等）
 //!   STARRYCLAW_API_KEY / OPENAI_API_KEY — 需要时带 `Authorization: Bearer …`（Ollama 一般不用）
+//!   STARRYCLAW_WHEEL_CMD — 可选；`wheel_move` 仅 `println!` 打印「该命令 + forward|backward|left|right」，不 exec
 //!   NO_COLOR / STARRYCLAW_NO_COLOR — 若设置则提示符不用 ANSI 颜色
 //!
 //! **主机用 localhost、QEMU 里 StarryOS 怎么访问 PC 上的 Ollama？**\
@@ -94,7 +95,7 @@ mod openai;
 mod tools;
 
 use anyhow::{Context, Result};
-use openai::{openai_tool_definitions, ChatMessage, Client, ToolCall};
+use openai::{ChatMessage, Client, ToolCall};
 use serde_json::Value;
 use std::env;
 use std::io::Write;
@@ -108,7 +109,7 @@ async fn agent_turn(
     user_text: &str,
     messages: &mut Vec<ChatMessage>,
 ) -> Result<String> {
-    let defs = openai_tool_definitions();
+    let defs = tools::openai_tool_definitions();
     let user_payload = format!(
         "User instruction (may be vague, colloquial, or Chinese short phrases — infer intent):\n{}",
         user_text
@@ -208,8 +209,8 @@ async fn main() -> Result<()> {
         role: "system".into(),
         content: Some(Value::String(
             "You are StarryClaw (spell the name exactly StarryClaw, never StaryClaw), an autonomous agent on a Unix-like system (e.g. StarryOS). \
-             Tools: list_dir; mkdir (single segment under cwd); change_dir; read_file (text, size-capped); run_shell (single allowlisted program + args, no pipes/shell—see tool schema). \
-             Prefer tools when they match: 查目录/列文件→list_dir; 进目录→change_dir; 看文件内容→read_file; 建文件夹→mkdir; 日期/时间/今天几号/uname/pwd/whoami/df/cal 等只读系统信息→run_shell（如 date、date +%Y-%m-%d、uname -a）. \
+             Tools: list_dir; mkdir (single segment under cwd); change_dir; read_file (text, size-capped); run_shell (single allowlisted program + args, no pipes/shell—see tool schema); wheel_move (wheels: direction forward/backward/left/right or 前/后/左/右; optional distance e.g. 5mm); arm_action (robot arm: grab/release or 抓取/放下). \
+             Prefer tools when they match: 查目录/列文件→list_dir; 进目录→change_dir; 看文件内容→read_file; 建文件夹→mkdir; 底盘轮子含距离如走5mm→wheel_move; 机械臂抓取/放下→arm_action; 日期/时间/今天几号/uname/pwd/whoami/df/cal 等只读系统信息→run_shell（如 date、date +%Y-%m-%d、uname -a）. \
              When the need is NOT covered by any tool (e.g. grep, curl, free, ps): tell them they can try in their terminal. Start with 「可在 shell 中自行尝试：」and give 1–3 concrete commands with a one-line explanation each. Prefer read-only suggestions; never suggest curl|sh or rm -rf /. \
              If nothing fits (pure chat, too vague), say e.g. 「当前没有合适的内置工具，也想不到可建议的系统命令。」and optionally one short clarifying question. \
              After tool calls, summarize briefly in the user's language."
@@ -246,7 +247,7 @@ async fn main() -> Result<()> {
                 let reply = reply.trim();
                 println!();
                 if reply.is_empty() {
-                    println!("（没有收到模型回复。可再说具体些；列目录/进目录/读文件/建目录/日期时间等可说明；其它需求模型可建议你在 shell 里试的命令。）");
+                    println!("（没有收到模型回复。可再说具体些；列目录/进目录/读文件/建目录/轮子前后左右/日期时间等可说明；其它需求模型可建议你在 shell 里试的命令。）");
                 } else {
                     println!("{reply}");
                 }

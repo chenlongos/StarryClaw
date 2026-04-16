@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::time::Duration;
 
 #[derive(Debug, Serialize)]
@@ -175,98 +175,4 @@ impl Client {
 
         Ok((msg, text_out))
     }
-}
-
-pub fn openai_tool_definitions() -> Vec<Value> {
-    vec![
-        json!({
-            "type": "function",
-            "function": {
-                "name": "list_dir",
-                "description": "List files in a directory (runs ls -la). Use for fuzzy requests: 看看、有啥、列一下、当前目录、show what's here、list files、browse、打开看看、里有什么.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Directory path; use . for current directory"
-                        }
-                    },
-                    "required": []
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "mkdir",
-                "description": "Create one directory (mkdir -p), name only, no path. Fuzzy: 建个xx、新建文件夹、帮我创建、make a folder、mkdir foo、弄个目录叫.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Single directory name in the current working directory (no slashes or ..)"
-                        }
-                    },
-                    "required": ["name"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "change_dir",
-                "description": "Change current working directory (cd). Use for: 进入xx目录、切换到、cd foo、chdir、去某个文件夹.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Target directory path (relative or absolute, .. allowed)"
-                        }
-                    },
-                    "required": ["path"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read text file contents (UTF-8 / lossy). Use for: 查看文件、读一下、cat、show content、打开某某文件.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File path"
-                        },
-                        "max_bytes": {
-                            "type": "integer",
-                            "description": "Optional max bytes to read (default 262144, cap 2097152)"
-                        }
-                    },
-                    "required": ["path"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "run_shell",
-                "description": "Run a single allowlisted program with arguments (no shell, no pipes). For 今天几号/日期/时间 call date (e.g. date +%Y-%m-%d). For kernel/OS: uname -a. Also: pwd, whoami, hostname, uptime, cal, df, env, which, wc, head, tail, id, stat, file, readlink, etc. If not in this tool's allowlist (e.g. free, grep, curl), tell the user to run it in their terminal. Prefer run_shell over only suggesting markdown when the command is allowlisted.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "One program name plus args, whitespace-separated (e.g. \"date +%Y-%m-%d\", \"uname -a\"). No ; | & $ ` or newlines."
-                        }
-                    },
-                    "required": ["command"]
-                }
-            }
-        }),
-    ]
 }
